@@ -10,15 +10,19 @@ use image::io::Reader as ImageReader;
 use image::{ ImageFormat, Rgba, RgbaImage};
 use imageproc::drawing::draw_text_mut;
 use rusttype::{Font, Scale};
+use std::fs;
 use std::io::Cursor;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tower_http::cors::{ CorsLayer, Any };
+use tower_http::services::ServeDir;
 
 #[tokio::main]
 async fn main() {
     let app = Router::new()
+        .nest_service("/", ServeDir::new("frontend/build"))
         .route("/upload", post(upload_image))
+        .route("/preview", get(preview_image))
         .route("/download", get(download_image))
         .layer(CorsLayer::new().allow_origin(Any));
 
@@ -27,6 +31,17 @@ async fn main() {
         .serve(app.into_make_service())
         .await
         .unwrap();
+}
+
+// 画像プレビュー用のエンドポイント
+async fn preview_image() -> Result<impl IntoResponse, (StatusCode, &'static str)> {
+    let image_path = "output.png"; // 作成した画像のパス
+    let image_data = fs::read(image_path).map_err(|_| (StatusCode::NOT_FOUND, "Image not found"))?;
+    
+    Ok(Response::builder()
+        .header("Content-Type", "image/png")
+        .body(Body::from(image_data))
+        .unwrap())
 }
 
 async fn download_image() -> Result<impl IntoResponse, (StatusCode, &'static str)> {
