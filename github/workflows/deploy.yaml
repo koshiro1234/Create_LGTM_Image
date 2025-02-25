@@ -1,0 +1,12 @@
+# .github/workflows/deploy.yml
+name: Deploy to GitHub Pages
+on: push
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - run: cargo build --release
+      - run: mv target/release/my-app public/
+      - uses: actions/upload-pages-artifact@v1
+      - uses: actions/deploy-pages@v1
