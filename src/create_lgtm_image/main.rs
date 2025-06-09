@@ -75,7 +75,7 @@ async fn upload_image(mut multipart: Multipart) -> impl IntoResponse {
         let img = reader.decode().expect("画像のデコード失敗");
 
         let mut img = img.to_rgba8();
-        add_text(&mut img);
+        add_text(&mut img, "LGTM", "#FFFFFFFF", "center");
 
         // 画像を適切なフォーマットで保存
         let mut file = File::create("output.png").await.unwrap();
@@ -92,10 +92,26 @@ async fn upload_image(mut multipart: Multipart) -> impl IntoResponse {
 #[derive(Deserialize)]
 struct FetchImageParams {
     url: String,
+    text: Option<String>,
+    #[serde(rename = "textColor")]
+    text_color: Option<String>,
+    #[serde(rename = "textPosition")]
+    text_position: Option<String>,
+    #[serde(rename = "outputFormat")]
+    output_format: Option<String>,
 }
 
 async fn fetch_image(Json(params): Json<FetchImageParams>) -> Result<impl IntoResponse, (StatusCode, &'static str)> {
     let url = &params.url;
+    let actual_text = params.text.unwrap_or_else(|| "LGTM".to_string());
+    let actual_color = params.text_color.unwrap_or_else(|| "#FFFFFFFF".to_string());
+    let actual_position = params.text_position.unwrap_or_else(|| "center".to_string());
+    let desired_format_str = params.output_format.unwrap_or_else(|| "png".to_string()).to_lowercase();
+
+    let (image_format_enum, content_type_str) = match desired_format_str.as_str() {
+        "jpeg" | "jpg" => (ImageFormat::Jpeg, "image/jpeg"),
+        "png" | _ => (ImageFormat::Png, "image/png"), // Default to PNG
+    };
     let bytes = if url.starts_with("data:") {
         // dataスキームを解析
         let base64_data = url.split(',').nth(1).ok_or((StatusCode::BAD_REQUEST, "Invalid data URL"))?;
@@ -116,36 +132,106 @@ async fn fetch_image(Json(params): Json<FetchImageParams>) -> Result<impl IntoRe
     let img = reader.decode().expect("画像のデコード失敗");
 
     let mut img = img.to_rgba8();
-    add_text(&mut img);
+    add_text(&mut img, &actual_text, &actual_color, &actual_position);
 
     let mut buffer = Cursor::new(Vec::new());
-    img.write_to(&mut buffer, ImageFormat::Png).expect("画像の保存失敗");
+    img.write_to(&mut buffer, image_format_enum).expect("画像の保存失敗");
 
     Ok(Response::builder()
-        .header("Content-Type", "image/png")
+        .header("Content-Type", content_type_str)
         .body(Body::from(buffer.into_inner()))
         .unwrap())
 }
 
-fn add_text(img: &mut RgbaImage) {
+fn add_text(img: &mut RgbaImage, text: &str, color_hex: &str, position: &str) {
     let font_data = include_bytes!("../../DejaVu_Sans/DejaVuSans-Bold.ttf");
     let font = Font::try_from_bytes(font_data).expect("フォントの読み込み失敗");
 
-    // 画像サイズに基づいてフォントサイズを計算
-    let scale = Scale::uniform(img.width() as f32 / 5.0);
+    let color = parse_hex_color(color_hex);
 
-    // 文字の幅と高さを計算
-    let v_metrics = font.v_metrics(scale);
-    let glyphs: Vec<_> = font.layout("LGTM", scale, point(0.0, v_metrics.ascent)).collect();
-    let width = glyphs.iter().rev().filter_map(|g| g.pixel_bounding_box().map(|b| b.max.x as f32)).next().unwrap_or(0.0);
-    let height = v_metrics.ascent - v_metrics.descent;
+    // Initial font scale based on image height.
+    // Adjusted for very long text to prevent excessively small font from the start.
+    let mut current_scale_val = if text.len() > 20 { // Heuristic for "very long"
+        img.height() as f32 / (text.len() as f32 / 2.5) // More aggressive scaling down for long text
+    } else if text.len() > 10 {
+        img.height() as f32 / (text.len() as f32 / 1.8) // Moderate scaling for medium text
+    } else {
+        img.height() as f32 / 5.0 // Default for short text
+    };
+    // Ensure scale is not excessively small or zero if image height is tiny or text extremely long
+    if current_scale_val < 1.0 { current_scale_val = 1.0; }
 
-    // フォントサイズを調整して文字の幅が画像の幅に収まるようにする
-    let scale = Scale::uniform(scale.x * (img.width() as f32 / width));
+    let mut scale = Scale::uniform(current_scale_val);
 
-    // 文字の位置を画像の中央に設定
-    let x = 0; // 左寄せ
-    let y = (img.height() as f32 - height) / 2.0 + v_metrics.ascent;
+    // Calculate text width and height with this initial scale
+    let mut v_metrics = font.v_metrics(scale);
+    let mut glyphs: Vec<_> = font.layout(text, scale, point(0.0, 0.0)).collect();
+    let mut text_width = glyphs.iter().filter_map(|g| g.pixel_bounding_box()).map(|bb| bb.max.x as f32).last().unwrap_or(0.0);
+    let mut text_height = v_metrics.ascent - v_metrics.descent; // Full height of the text block
 
-    draw_text_mut(img, Rgba([255, 255, 255, 255]), x as i32, y as i32, scale, &font, "LGTM");
+    // Adjust scale if text width is too large for the image (e.g., > 90% of image width)
+    let max_text_width_ratio = 0.90;
+    if text_width > img.width() as f32 * max_text_width_ratio && text_width > 0.0 {
+        let new_scale_factor = (img.width() as f32 * max_text_width_ratio) / text_width;
+        current_scale_val *= new_scale_factor;
+        if current_scale_val < 1.0 { current_scale_val = 1.0; } // Prevent scale from becoming too small
+        scale = Scale::uniform(current_scale_val);
+
+        // Recalculate metrics with the new, adjusted scale
+        v_metrics = font.v_metrics(scale);
+        glyphs = font.layout(text, scale, point(0.0, 0.0)).collect();
+        text_width = glyphs.iter().filter_map(|g| g.pixel_bounding_box()).map(|bb| bb.max.x as f32).last().unwrap_or(0.0);
+        text_height = v_metrics.ascent - v_metrics.descent;
+    }
+
+    let final_scale = scale;
+    let v_metrics_final = v_metrics; // Use the potentially adjusted v_metrics
+    let actual_text_glyph_height = text_height; // Height of the text glyphs based on final scale
+
+    // Calculate base x and y for text drawing based on position string
+    let (mut x_pos, mut y_pos_base) = match position {
+        "top-left" => (0.0, 0.0),
+        "top-center" => ((img.width() as f32 - text_width) / 2.0, 0.0),
+        "top-right" => (img.width() as f32 - text_width, 0.0),
+        "center-left" => (0.0, (img.height() as f32 - actual_text_glyph_height) / 2.0),
+        "center" => ((img.width() as f32 - text_width) / 2.0, (img.height() as f32 - actual_text_glyph_height) / 2.0),
+        "center-right" => (img.width() as f32 - text_width, (img.height() as f32 - actual_text_glyph_height) / 2.0),
+        "bottom-left" => (0.0, img.height() as f32 - actual_text_glyph_height),
+        "bottom-center" => ((img.width() as f32 - text_width) / 2.0, img.height() as f32 - actual_text_glyph_height),
+        "bottom-right" => (img.width() as f32 - text_width, img.height() as f32 - actual_text_glyph_height),
+        _ => ((img.width() as f32 - text_width) / 2.0, (img.height() as f32 - actual_text_glyph_height) / 2.0), // Default
+    };
+
+    // Ensure x_pos is not negative (can happen if text_width is slightly larger than image due to approximations)
+    if x_pos < 0.0 { x_pos = 0.0; }
+    if y_pos_base < 0.0 {y_pos_base = 0.0; }
+
+
+    // Adjust y_pos to account for font ascent (baseline for drawing)
+    let y_pos = y_pos_base + v_metrics_final.ascent;
+
+    draw_text_mut(img, color, x_pos as i32, y_pos as i32, final_scale, &font, text);
+}
+
+// Helper function to parse hex color string
+fn parse_hex_color(hex_str: &str) -> Rgba<u8> {
+    let hex = hex_str.trim_start_matches('#');
+    let default_color = Rgba([255, 255, 255, 255]); // White
+
+    match hex.len() {
+        6 => { // RRGGBB
+            let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(255);
+            let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(255);
+            let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(255);
+            Rgba([r, g, b, 255])
+        }
+        8 => { // RRGGBBAA
+            let r = u8::from_str_radix(&hex[0..2], 16).unwrap_or(255);
+            let g = u8::from_str_radix(&hex[2..4], 16).unwrap_or(255);
+            let b = u8::from_str_radix(&hex[4..6], 16).unwrap_or(255);
+            let a = u8::from_str_radix(&hex[6..8], 16).unwrap_or(255);
+            Rgba([r, g, b, a])
+        }
+        _ => default_color, // Invalid length
+    }
 }
